@@ -1,0 +1,23 @@
+{
+    "name": "rexlu/laravelodbc",
+    "description": "Adds an ODBC(PDO) driver package to Laravel 4.2, use special method.",
+    "keywords": ["laravel","database","mysql","oracle"],
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "rexlu",
+            "email": "lance70176@gmail.com"
+        }
+    ],
+    "require": {
+        "php": ">=5.3.0",
+        "illuminate/support": "~4.2",
+		"illuminate/database": "~4.2"
+    },
+    "autoload": {
+        "psr-0": {
+            "rexlu\\Laravelodbc": "src/"
+        }
+    },
+    "minimum-stability": "dev"
+}
