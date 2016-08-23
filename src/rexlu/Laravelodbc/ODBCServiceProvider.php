@@ -31,7 +31,7 @@ class ODBCServiceProvider extends ServiceProvider {
             $pdo = $connector->connect($config);
 
             $db = new ODBCConnection($pdo, $config['database'], $config['prefix']);
-            $db->setDateFormat('YYYY-MM-DD HH24:MI:SS');
+            //$db->setDateFormat('YYYY-MM-DD HH24:MI:SS');
 
             return $db;
         });

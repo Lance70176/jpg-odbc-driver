@@ -1,6 +1,8 @@
 <?php
 namespace rexlu\Laravelodbc;
 
+use rexlu\Laravelodbc\ODBCSchemaGrammar as SchemaGrammar;
+use rexlu\Laravelodbc\ODBCQueryGrammar as QueryGrammar;
 use Illuminate\Database\Connection;
 use PDO;
 
@@ -13,7 +15,7 @@ class ODBCConnection extends Connection {
      */
     protected function getDefaultQueryGrammar()
     {
-        return $this->withTablePrefix(new ODBCQueryGrammar);
+        return $this->withTablePrefix(new QueryGrammar);
     }
 
     /**
@@ -23,7 +25,7 @@ class ODBCConnection extends Connection {
      */
     protected function getDefaultSchemaGrammar()
     {
-        return $this->withTablePrefix(new ODBCSchemaGrammar);
+        return $this->withTablePrefix(new SchemaGrammar);
     }
 
     /**
