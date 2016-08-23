@@ -55,10 +55,6 @@ class ODBCQueryGrammar extends Grammar {
 
         if (is_null($query->columns)) $query->columns = array('*');
 
-
-        var_dump( trim($this->concatenate($this->compileComponents($query))));
-        exit;
-
         return trim($this->concatenate($this->compileComponents($query)));
     }
 
@@ -85,8 +81,6 @@ class ODBCQueryGrammar extends Grammar {
                 $sql[$component] = $this->$method($query, $query->$component);
             }
         }
-
-        //var_dump(111);exit;
 
         return $sql;
     }
