@@ -2,10 +2,12 @@
 namespace rexlu\Laravelodbc;
 
 use Illuminate\Database\Query\Grammars\Grammar;
-use Illuminate\Database\Query\Builder;
+use rexlu\Laravelodbc\ODBCQueryBuilder as Builder;
+use Illuminate\Database\Query\Grammars\MySqlGrammar;
 
-class ODBCQueryGrammar extends Grammar {
+use Illuminate\Database\Grammar as BaseGrammar;
 
+class ODBCQueryGrammar extends BaseGrammar {
 
     /**
      * The components that make up a select clause.
@@ -16,7 +18,6 @@ class ODBCQueryGrammar extends Grammar {
         'aggregate',
         'columns',
         'from',
-        'useIndex',
         'joins',
         'wheres',
         'groups',
@@ -29,42 +30,45 @@ class ODBCQueryGrammar extends Grammar {
     );
 
     /**
-     * Compile the "from" portion of the query.
-     *
-     * @param  \Illuminate\Database\Query\Builder  $query
-     * @param  string  $table
-     * @return string
-     */
-    protected function compileUseIndex(Builder $query)
-    {
-        $result = "";
-        if (!is_null($query->useIndex)) {
-            $result = " use index ({$query->useIndex}) ";
-        }
-        return $result;
-    }
-
-    /**
      * Compile a select query into SQL.
      *
-     * @param  \Illuminate\Database\Query\Builder
+     * @param  \rexlu\Laravelodbc\ODBCQueryBuilder
      * @return string
      */
-    public function compileSelect(Builder $query)
+    public function _compileSelect($query)
     {
-
-        if (is_null($query->columns)) $query->columns = array('*');
+        if (is_null($query->columns)) {
+            $query->columns = array('*');
+        }
 
         return trim($this->concatenate($this->compileComponents($query)));
     }
 
     /**
+     * Compile a select query into SQL.
+     *
+     * @param \rexlu\Laravelodbc\ODBCQueryBuilder
+     * @return string
+     */
+    public function compileSelect($query)
+    {
+        $sql = self::_compileSelect($query);
+
+        if ($query->unions)
+        {
+            $sql = '('.$sql.') '.$this->compileUnions($query);
+        }
+
+        return $sql;
+    }
+
+    /**
      * Compile the components necessary for a select clause.
      *
-     * @param  \Illuminate\Database\Query\Builder
+     * @param  \rexlu\Laravelodbc\ODBCQueryBuilder
      * @return array
      */
-    protected function compileComponents(Builder $query)
+    protected function compileComponents($query)
     {
         $sql = array();
 
@@ -76,7 +80,6 @@ class ODBCQueryGrammar extends Grammar {
             if ( ! is_null($query->$component))
             {
                 $method = 'compile'.ucfirst($component);
-                //pr($query->$component);
 
                 $sql[$component] = $this->$method($query, $query->$component);
             }
@@ -86,587 +89,691 @@ class ODBCQueryGrammar extends Grammar {
     }
 
     /**
-     * The keyword identifier wrapper format.
+     * Compile an aggregated select clause.
      *
-     * @var string
-     */
-    protected $wrapper = '`%s`';
-
-    /**
-     * The possible column modifiers.
-     *
-     * @var array
-     */
-    protected $modifiers = array('Unsigned', 'Nullable', 'Default', 'Increment', 'After', 'Comment');
-
-    /**
-     * The possible column serials
-     *
-     * @var array
-     */
-    protected $serials = array('bigInteger', 'integer', 'mediumInteger', 'smallInteger', 'tinyInteger');
-
-    /**
-     * Compile the query to determine the list of tables.
-     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $aggregate
      * @return string
      */
-    public function compileTableExists()
+    protected function compileAggregate($query, $aggregate)
     {
-        return 'select * from information_schema.tables where table_schema = ? and table_name = ?';
+        $column = $this->columnize($aggregate['columns']);
+
+        // If the query has a "distinct" constraint and we're not asking for all columns
+        // we need to prepend "distinct" onto the column name so that the query takes
+        // it into account when it performs the aggregating operations on the data.
+        if ($query->distinct && $column !== '*')
+        {
+            $column = 'distinct '.$column;
+        }
+
+        return 'select '.$aggregate['function'].'('.$column.') as aggregate';
     }
 
     /**
-     * Compile the query to determine the list of columns.
+     * Compile the "select *" portion of the query.
      *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $columns
+     * @return string
+     */
+    protected function compileColumns($query, $columns)
+    {
+        // If the query is actually performing an aggregating select, we will let that
+        // compiler handle the building of the select clauses, as it will need some
+        // more syntax that is best handled by that function to keep things neat.
+        if ( ! is_null($query->aggregate)) return;
+
+        $select = $query->distinct ? 'select distinct ' : 'select ';
+
+        return $select.$this->columnize($columns);
+    }
+
+    /**
+     * Compile the "from" portion of the query.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
      * @param  string  $table
      * @return string
      */
-    public function compileColumnExists()
+    protected function compileFrom($query, $table)
     {
-        return "select column_name from information_schema.columns where table_schema = ? and table_name = ?";
+        $result = 'from '.$this->wrapTable($table);
+
+        # 检查是否加入 use index 到 sql 语法 start
+        if (isset($query->useIndex))  {
+            if (!is_null($query->useIndex)) {
+                $result = $result." use index ({$query->useIndex}) ";
+            }
+        }
+        # 检查是否加入 use index 到 sql 语法 end
+
+        return $result;
     }
 
     /**
-     * Compile a create table command.
+     * Compile the "join" portions of the query.
      *
-     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param  \Illuminate\Support\Fluent  $command
-     * @param  \Illuminate\Database\Connection  $connection
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $joins
      * @return string
      */
-    public function compileCreate(Blueprint $blueprint, Fluent $command, Connection $connection)
+    protected function compileJoins($query, $joins)
     {
-        $columns = implode(', ', $this->getColumns($blueprint));
+        $sql = array();
 
-        $sql = 'create table '.$this->wrapTable($blueprint)." ($columns)";
+        $query->setBindings(array(), 'join');
 
-        // Once we have the primary SQL, we can add the encoding option to the SQL for
-        // the table.  Then, we can check if a storage engine has been supplied for
-        // the table. If so, we will add the engine declaration to the SQL query.
-        $sql = $this->compileCreateEncoding($sql, $connection);
-
-        if (isset($blueprint->engine))
+        foreach ($joins as $join)
         {
-            $sql .= ' engine = '.$blueprint->engine;
+            $table = $this->wrapTable($join->table);
+
+            // First we need to build all of the "on" clauses for the join. There may be many
+            // of these clauses so we will need to iterate through each one and build them
+            // separately, then we'll join them up into a single string when we're done.
+            $clauses = array();
+
+            foreach ($join->clauses as $clause)
+            {
+                $clauses[] = $this->compileJoinConstraint($clause);
+            }
+
+            foreach ($join->bindings as $binding)
+            {
+                $query->addBinding($binding, 'join');
+            }
+
+            // Once we have constructed the clauses, we'll need to take the boolean connector
+            // off of the first clause as it obviously will not be required on that clause
+            // because it leads the rest of the clauses, thus not requiring any boolean.
+            $clauses[0] = $this->removeLeadingBoolean($clauses[0]);
+
+            $clauses = implode(' ', $clauses);
+
+            $type = $join->type;
+
+            // Once we have everything ready to go, we will just concatenate all the parts to
+            // build the final join statement SQL for the query and we can then return the
+            // final clause back to the callers as a single, stringified join statement.
+            $sql[] = "$type join $table on $clauses";
         }
 
-        return $sql;
+        return implode(' ', $sql);
     }
 
     /**
-     * Append the character set specifications to a command.
+     * Create a join clause constraint segment.
      *
-     * @param  string  $sql
-     * @param  \Illuminate\Database\Connection  $connection
+     * @param  array   $clause
      * @return string
      */
-    protected function compileCreateEncoding($sql, Connection $connection)
+    protected function compileJoinConstraint(array $clause)
     {
-        if ( ! is_null($charset = $connection->getConfig('charset')))
+        $first = $this->wrap($clause['first']);
+
+        $second = $clause['where'] ? '?' : $this->wrap($clause['second']);
+
+        return "{$clause['boolean']} $first {$clause['operator']} $second";
+    }
+
+    /**
+     * Compile the "where" portions of the query.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @return string
+     */
+    protected function compileWheres($query)
+    {
+        $sql = array();
+
+        if (is_null($query->wheres)) return '';
+
+        // Each type of where clauses has its own compiler function which is responsible
+        // for actually creating the where clauses SQL. This helps keep the code nice
+        // and maintainable since each clause has a very small method that it uses.
+        foreach ($query->wheres as $where)
         {
-            $sql .= ' default character set '.$charset;
+            $method = "where{$where['type']}";
+
+            $sql[] = $where['boolean'].' '.$this->$method($query, $where);
         }
 
-        if ( ! is_null($collation = $connection->getConfig('collation')))
+        // If we actually have some where clauses, we will strip off the first boolean
+        // operator, which is added by the query builders for convenience so we can
+        // avoid checking for the first clauses in each of the compilers methods.
+        if (count($sql) > 0)
         {
-            $sql .= ' collate '.$collation;
+            $sql = implode(' ', $sql);
+
+            return 'where '.preg_replace('/and |or /', '', $sql, 1);
         }
 
-        return $sql;
+        return '';
     }
 
     /**
-     * Compile a create table command.
+     * Compile a nested where clause.
      *
-     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param  \Illuminate\Support\Fluent  $command
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
      * @return string
      */
-    public function compileAdd(Blueprint $blueprint, Fluent $command)
+    protected function whereNested($query, $where)
     {
-        $table = $this->wrapTable($blueprint);
+        $nested = $where['query'];
 
-        $columns = $this->prefixArray('add', $this->getColumns($blueprint));
-
-        return 'alter table '.$table.' '.implode(', ', $columns);
-    }
-
-     /**
-     * Compile an update column command.
-     *
-     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param  \Illuminate\Support\Fluent  $command
-     * @return string
-     */
-    public function compileUpdateColumn(Blueprint $blueprint, Fluent $command)
-    {
-        $table = $this->wrapTable($blueprint);
-        $type = $this->{'type'.ucfirst($command->type)}($command);
-        $sql = "alter table {$table} modify {$command->columnName} {$type}";
-
-        return $this->addModifiers($sql, $blueprint, $command);
+        return '('.substr($this->compileWheres($nested), 6).')';
     }
 
     /**
-     * Compile a primary key command.
+     * Compile a where condition with a sub-select.
      *
-     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param  \Illuminate\Support\Fluent  $command
+     * @param  \Illuminate\Database\Query\Builder $query
+     * @param  array   $where
      * @return string
      */
-    public function compilePrimary(Blueprint $blueprint, Fluent $command)
+    protected function whereSub($query, $where)
     {
-        $command->name(null);
+        $select = $this->compileSelect($where['query']);
 
-        return $this->compileKey($blueprint, $command, 'primary key');
+        return $this->wrap($where['column']).' '.$where['operator']." ($select)";
     }
 
     /**
-     * Compile a unique key command.
+     * Compile a basic where clause.
      *
-     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param  \Illuminate\Support\Fluent  $command
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
      * @return string
      */
-    public function compileUnique(Blueprint $blueprint, Fluent $command)
+    protected function whereBasic($query, $where)
     {
-        return $this->compileKey($blueprint, $command, 'unique');
+        $value = $this->parameter($where['value']);
+
+        return $this->wrap($where['column']).' '.$where['operator'].' '.$value;
     }
 
     /**
-     * Compile a plain index key command.
+     * Compile a "between" where clause.
      *
-     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param  \Illuminate\Support\Fluent  $command
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
      * @return string
      */
-    public function compileIndex(Blueprint $blueprint, Fluent $command)
+    protected function whereBetween($query, $where)
     {
-        return $this->compileKey($blueprint, $command, 'index');
+        $between = $where['not'] ? 'not between' : 'between';
+
+        return $this->wrap($where['column']).' '.$between.' ? and ?';
     }
 
     /**
-     * Compile an index creation command.
+     * Compile a where exists clause.
      *
-     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param  \Illuminate\Support\Fluent  $command
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    protected function whereExists($query, $where)
+    {
+        return 'exists ('.$this->compileSelect($where['query']).')';
+    }
+
+    /**
+     * Compile a where exists clause.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    protected function whereNotExists($query, $where)
+    {
+        return 'not exists ('.$this->compileSelect($where['query']).')';
+    }
+
+    /**
+     * Compile a "where in" clause.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    protected function whereIn($query, $where)
+    {
+        if (empty($where['values'])) return '0 = 1';
+
+        $values = $this->parameterize($where['values']);
+
+        return $this->wrap($where['column']).' in ('.$values.')';
+    }
+
+    /**
+     * Compile a "where not in" clause.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    protected function whereNotIn($query, $where)
+    {
+        if (empty($where['values'])) return '1 = 1';
+
+        $values = $this->parameterize($where['values']);
+
+        return $this->wrap($where['column']).' not in ('.$values.')';
+    }
+
+    /**
+     * Compile a where in sub-select clause.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    protected function whereInSub($query, $where)
+    {
+        $select = $this->compileSelect($where['query']);
+
+        return $this->wrap($where['column']).' in ('.$select.')';
+    }
+
+    /**
+     * Compile a where not in sub-select clause.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    protected function whereNotInSub($query, $where)
+    {
+        $select = $this->compileSelect($where['query']);
+
+        return $this->wrap($where['column']).' not in ('.$select.')';
+    }
+
+    /**
+     * Compile a "where null" clause.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    protected function whereNull($query, $where)
+    {
+        return $this->wrap($where['column']).' is null';
+    }
+
+    /**
+     * Compile a "where not null" clause.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    protected function whereNotNull($query, $where)
+    {
+        return $this->wrap($where['column']).' is not null';
+    }
+
+    /**
+     * Compile a "where date" clause.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    protected function whereDate($query, $where)
+    {
+        return $this->dateBasedWhere('date', $query, $where);
+    }
+
+    /**
+     * Compile a "where day" clause.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    protected function whereDay($query, $where)
+    {
+        return $this->dateBasedWhere('day', $query, $where);
+    }
+
+    /**
+     * Compile a "where month" clause.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    protected function whereMonth($query, $where)
+    {
+        return $this->dateBasedWhere('month', $query, $where);
+    }
+
+    /**
+     * Compile a "where year" clause.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    protected function whereYear($query, $where)
+    {
+        return $this->dateBasedWhere('year', $query, $where);
+    }
+
+    /**
+     * Compile a date based where clause.
+     *
      * @param  string  $type
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
      * @return string
      */
-    protected function compileKey(Blueprint $blueprint, Fluent $command, $type)
+    protected function dateBasedWhere($type, $query, $where)
     {
-        $columns = $this->columnize($command->columns);
+        $value = $this->parameter($where['value']);
 
-        $table = $this->wrapTable($blueprint);
-
-        return "alter table {$table} add {$type} {$command->index}($columns)";
+        return $type.'('.$this->wrap($where['column']).') '.$where['operator'].' '.$value;
     }
 
     /**
-     * Compile a drop table command.
+     * Compile a raw where clause.
      *
-     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param  \Illuminate\Support\Fluent  $command
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
      * @return string
      */
-    public function compileDrop(Blueprint $blueprint, Fluent $command)
+    protected function whereRaw($query, $where)
     {
-        return 'drop table '.$this->wrapTable($blueprint);
+        return $where['sql'];
     }
 
     /**
-     * Compile a drop table (if exists) command.
+     * Compile the "group by" portions of the query.
      *
-     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param  \Illuminate\Support\Fluent  $command
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $groups
      * @return string
      */
-    public function compileDropIfExists(Blueprint $blueprint, Fluent $command)
+    protected function compileGroups($query, $groups)
     {
-        return 'drop table if exists '.$this->wrapTable($blueprint);
+        return 'group by '.$this->columnize($groups);
     }
 
     /**
-     * Compile a drop column command.
+     * Compile the "having" portions of the query.
      *
-     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param  \Illuminate\Support\Fluent  $command
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $havings
      * @return string
      */
-    public function compileDropColumn(Blueprint $blueprint, Fluent $command)
+    protected function compileHavings($query, $havings)
     {
-        $columns = $this->prefixArray('drop', $this->wrapArray($command->columns));
+        $sql = implode(' ', array_map(array($this, 'compileHaving'), $havings));
 
-        $table = $this->wrapTable($blueprint);
-
-        return 'alter table '.$table.' '.implode(', ', $columns);
+        return 'having '.preg_replace('/and |or /', '', $sql, 1);
     }
 
     /**
-     * Compile a drop primary key command.
+     * Compile a single having clause.
      *
-     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param  \Illuminate\Support\Fluent  $command
+     * @param  array   $having
      * @return string
      */
-    public function compileDropPrimary(Blueprint $blueprint, Fluent $command)
+    protected function compileHaving(array $having)
     {
-        return 'alter table '.$this->wrapTable($blueprint).' drop primary key';
-    }
-
-    /**
-     * Compile a drop unique key command.
-     *
-     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param  \Illuminate\Support\Fluent  $command
-     * @return string
-     */
-    public function compileDropUnique(Blueprint $blueprint, Fluent $command)
-    {
-        $table = $this->wrapTable($blueprint);
-
-        return "alter table {$table} drop index {$command->index}";
-    }
-
-    /**
-     * Compile a drop index command.
-     *
-     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param  \Illuminate\Support\Fluent  $command
-     * @return string
-     */
-    public function compileDropIndex(Blueprint $blueprint, Fluent $command)
-    {
-        $table = $this->wrapTable($blueprint);
-
-        return "alter table {$table} drop index {$command->index}";
-    }
-
-    /**
-     * Compile a drop foreign key command.
-     *
-     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param  \Illuminate\Support\Fluent  $command
-     * @return string
-     */
-    public function compileDropForeign(Blueprint $blueprint, Fluent $command)
-    {
-        $table = $this->wrapTable($blueprint);
-
-        return "alter table {$table} drop foreign key {$command->index}";
-    }
-
-    /**
-     * Compile a rename table command.
-     *
-     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param  \Illuminate\Support\Fluent  $command
-     * @return string
-     */
-    public function compileRename(Blueprint $blueprint, Fluent $command)
-    {
-        $from = $this->wrapTable($blueprint);
-
-        return "rename table {$from} to ".$this->wrapTable($command->to);
-    }
-
-    /**
-     * Create the column definition for a char type.
-     *
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string
-     */
-    protected function typeChar(Fluent $column)
-    {
-        return "char({$column->length})";
-    }
-
-    /**
-     * Create the column definition for a string type.
-     *
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string
-     */
-    protected function typeString(Fluent $column)
-    {
-        return "varchar({$column->length})";
-    }
-
-    /**
-     * Create the column definition for a text type.
-     *
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string
-     */
-    protected function typeText(Fluent $column)
-    {
-        return 'text';
-    }
-
-    /**
-     * Create the column definition for a medium text type.
-     *
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string
-     */
-    protected function typeMediumText(Fluent $column)
-    {
-        return 'mediumtext';
-    }
-
-    /**
-     * Create the column definition for a long text type.
-     *
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string
-     */
-    protected function typeLongText(Fluent $column)
-    {
-        return 'longtext';
-    }
-
-    /**
-     * Create the column definition for a big integer type.
-     *
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string
-     */
-    protected function typeBigInteger(Fluent $column)
-    {
-        return 'bigint';
-    }
-
-    /**
-     * Create the column definition for a integer type.
-     *
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string
-     */
-    protected function typeInteger(Fluent $column)
-    {
-        return 'int';
-    }
-
-    /**
-     * Create the column definition for a medium integer type.
-     *
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string
-     */
-    protected function typeMediumInteger(Fluent $column)
-    {
-        return 'mediumint';
-    }
-
-    /**
-     * Create the column definition for a tiny integer type.
-     *
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string
-     */
-    protected function typeTinyInteger(Fluent $column)
-    {
-        return 'tinyint';
-    }
-
-    /**
-     * Create the column definition for a small integer type.
-     *
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string
-     */
-    protected function typeSmallInteger(Fluent $column)
-    {
-        return 'smallint';
-    }
-
-    /**
-     * Create the column definition for a float type.
-     *
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string
-     */
-    protected function typeFloat(Fluent $column)
-    {
-        return "float({$column->total}, {$column->places})";
-    }
-
-    /**
-     * Create the column definition for a double type.
-     *
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string
-     */
-    protected function typeDouble(Fluent $column)
-    {
-        if ($column->total && $column->places)
+        // If the having clause is "raw", we can just return the clause straight away
+        // without doing any more processing on it. Otherwise, we will compile the
+        // clause into SQL based on the components that make it up from builder.
+        if ($having['type'] === 'raw')
         {
-            return "double({$column->total}, {$column->places})";
+            return $having['boolean'].' '.$having['sql'];
+        }
+
+        return $this->compileBasicHaving($having);
+    }
+
+    /**
+     * Compile a basic having clause.
+     *
+     * @param  array   $having
+     * @return string
+     */
+    protected function compileBasicHaving($having)
+    {
+        $column = $this->wrap($having['column']);
+
+        $parameter = $this->parameter($having['value']);
+
+        return $having['boolean'].' '.$column.' '.$having['operator'].' '.$parameter;
+    }
+
+    /**
+     * Compile the "order by" portions of the query.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $orders
+     * @return string
+     */
+    protected function compileOrders($query, $orders)
+    {
+        return 'order by '.implode(', ', array_map(function($order)
+        {
+            if (isset($order['sql'])) return $order['sql'];
+
+            return $this->wrap($order['column']).' '.$order['direction'];
+        }
+        , $orders));
+    }
+
+    /**
+     * Compile the "limit" portions of the query.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  int  $limit
+     * @return string
+     */
+    protected function compileLimit($query, $limit)
+    {
+        return 'limit '.(int) $limit;
+    }
+
+    /**
+     * Compile the "offset" portions of the query.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  int  $offset
+     * @return string
+     */
+    protected function compileOffset($query, $offset)
+    {
+        return 'offset '.(int) $offset;
+    }
+
+    /**
+     * Compile the "union" queries attached to the main query.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @return string
+     */
+    protected function compileUnions($query)
+    {
+        $sql = '';
+
+        foreach ($query->unions as $union)
+        {
+            $sql .= $this->compileUnion($union);
+        }
+
+        if (isset($query->unionOrders))
+        {
+            $sql .= ' '.$this->compileOrders($query, $query->unionOrders);
+        }
+
+        if (isset($query->unionLimit))
+        {
+            $sql .= ' '.$this->compileLimit($query, $query->unionLimit);
+        }
+
+        if (isset($query->unionOffset))
+        {
+            $sql .= ' '.$this->compileOffset($query, $query->unionOffset);
+        }
+
+        return ltrim($sql);
+    }
+
+    /**
+     * Compile a single union statement.
+     *
+     * @param  array  $union
+     * @return string
+     */
+    protected function compileUnion(array $union)
+    {
+       $joiner = $union['all'] ? ' union all ' : ' union ';
+
+        return $joiner.'('.$union['query']->toSql().')';
+    }
+
+    /**
+     * Compile an insert statement into SQL.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $values
+     * @return string
+     */
+    public function compileInsert($query, array $values)
+    {
+        // Essentially we will force every insert to be treated as a batch insert which
+        // simply makes creating the SQL easier for us since we can utilize the same
+        // basic routine regardless of an amount of records given to us to insert.
+        $table = $this->wrapTable($query->from);
+
+        if ( ! is_array(reset($values)))
+        {
+            $values = array($values);
+        }
+
+        $columns = $this->columnize(array_keys(reset($values)));
+
+        // We need to build a list of parameter place-holders of values that are bound
+        // to the query. Each insert should have the exact same amount of parameter
+        // bindings so we can just go off the first list of values in this array.
+        $parameters = $this->parameterize(reset($values));
+
+        $value = array_fill(0, count($values), "($parameters)");
+
+        $parameters = implode(', ', $value);
+
+        $result = "insert into $table ($columns) values $parameters";
+
+        return $result;
+    }
+
+    /**
+     * Compile an insert and get ID statement into SQL.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array   $values
+     * @param  string  $sequence
+     * @return string
+     */
+    public function compileInsertGetId($query, $values, $sequence)
+    {
+        return $this->compileInsert($query, $values);
+    }
+
+    /**
+     * Compile an update statement into SQL.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $values
+     * @return string
+     */
+    protected function _compileUpdate($query, $values)
+    {
+        $table = $this->wrapTable($query->from);
+
+        // Each one of the columns in the update statements needs to be wrapped in the
+        // keyword identifiers, also a place-holder needs to be created for each of
+        // the values in the list of bindings so we can make the sets statements.
+        $columns = array();
+
+        foreach ($values as $key => $value)
+        {
+            $columns[] = $this->wrap($key).' = '.$this->parameter($value);
+        }
+
+        $columns = implode(', ', $columns);
+
+        // If the query has any "join" clauses, we will setup the joins on the builder
+        // and compile them so we can attach them to this update, as update queries
+        // can get join statements to attach to other tables when they're needed.
+        if (isset($query->joins))
+        {
+            $joins = ' '.$this->compileJoins($query, $query->joins);
         }
         else
         {
-            return 'double';
+            $joins = '';
         }
+
+        // Of course, update queries may also be constrained by where clauses so we'll
+        // need to compile the where clauses and attach it to the query so only the
+        // intended records are updated by the SQL statements we generate to run.
+        $where = $this->compileWheres($query);
+
+        return trim("update {$table}{$joins} set $columns $where");
     }
 
     /**
-     * Create the column definition for a decimal type.
+     * Compile an update statement into SQL.
      *
-     * @param  \Illuminate\Support\Fluent  $column
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $values
      * @return string
      */
-    protected function typeDecimal(Fluent $column)
+    public function compileUpdate($query, $values)
     {
-        return "decimal({$column->total}, {$column->places})";
-    }
+        $sql = self::_compileUpdate($query, $values);
 
-    /**
-     * Create the column definition for a boolean type.
-     *
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string
-     */
-    protected function typeBoolean(Fluent $column)
-    {
-        return 'tinyint(1)';
-    }
-
-    /**
-     * Create the column definition for an enum type.
-     *
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string
-     */
-    protected function typeEnum(Fluent $column)
-    {
-        return "enum('".implode("', '", $column->allowed)."')";
-    }
-
-    /**
-     * Create the column definition for a date type.
-     *
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string
-     */
-    protected function typeDate(Fluent $column)
-    {
-        return 'date';
-    }
-
-    /**
-     * Create the column definition for a date-time type.
-     *
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string
-     */
-    protected function typeDateTime(Fluent $column)
-    {
-        return 'datetime';
-    }
-
-    /**
-     * Create the column definition for a time type.
-     *
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string
-     */
-    protected function typeTime(Fluent $column)
-    {
-        return 'time';
-    }
-
-    /**
-     * Create the column definition for a timestamp type.
-     *
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string
-     */
-    protected function typeTimestamp(Fluent $column)
-    {
-        if ( ! $column->nullable) return 'timestamp default 0';
-
-        return 'timestamp';
-    }
-
-    /**
-     * Create the column definition for a binary type.
-     *
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string
-     */
-    protected function typeBinary(Fluent $column)
-    {
-        return 'blob';
-    }
-
-    /**
-     * Get the SQL for an unsigned column modifier.
-     *
-     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string|null
-     */
-    protected function modifyUnsigned(Blueprint $blueprint, Fluent $column)
-    {
-        if ($column->unsigned) return ' unsigned';
-    }
-
-    /**
-     * Get the SQL for a nullable column modifier.
-     *
-     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string|null
-     */
-    protected function modifyNullable(Blueprint $blueprint, Fluent $column)
-    {
-        return $column->nullable ? ' null' : ' not null';
-    }
-
-    /**
-     * Get the SQL for a default column modifier.
-     *
-     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string|null
-     */
-    protected function modifyDefault(Blueprint $blueprint, Fluent $column)
-    {
-        if ( ! is_null($column->default))
+        if (isset($query->orders))
         {
-            return " default ".$this->getDefaultValue($column->default);
+            $sql .= ' '.$this->compileOrders($query, $query->orders);
         }
+
+        if (isset($query->limit))
+        {
+            $sql .= ' '.$this->compileLimit($query, $query->limit);
+        }
+
+        return rtrim($sql);
     }
 
-    /**
-     * Get the SQL for an auto-increment column modifier.
-     *
-     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string|null
-     */
-    protected function modifyIncrement(Blueprint $blueprint, Fluent $column)
-    {
-        if (in_array($column->type, $this->serials) && $column->autoIncrement)
-        {
-            return ' auto_increment primary key';
-        }
-    }
 
     /**
-     * Get the SQL for an "after" column modifier.
+     * Compile a delete statement into SQL.
      *
-     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param  \Illuminate\Support\Fluent  $column
-     * @return string|null
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @return string
      */
-    protected function modifyAfter(Blueprint $blueprint, Fluent $column)
+    public function compileDelete($query)
     {
-        if ( ! is_null($column->after))
+        $table = $this->wrapTable($query->from);
+
+        $where = is_array($query->wheres) ? $this->compileWheres($query) : '';
+
+        if (isset($query->joins))
         {
-            return ' after '.$this->wrap($column->after);
+            $joins = ' '.$this->compileJoins($query, $query->joins);
+
+            return trim("delete $table from {$table}{$joins} $where");
         }
+
+        return trim("delete from $table $where");
     }
 
     /**
@@ -683,17 +790,54 @@ class ODBCQueryGrammar extends Grammar {
     }
 
     /**
-     * Get the SQL for a "comment" column modifier.
+     * Compile a truncate table statement into SQL.
      *
-     * @param \Illuminate\Database\Schema\Blueprint  $blueprint
-     * @param \Illuminate\Support\Fluent             $column
-     * @return string|null
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @return array
      */
-    protected function modifyComment(Blueprint $blueprint, Fluent $column)
+    public function compileTruncate($query)
     {
-        if ( ! is_null($column->comment))
-        {
-            return " comment '".addslashes($column->comment)."'";
-        }
+        return array('truncate '.$this->wrapTable($query->from) => array());
     }
+
+    /**
+     * Compile the lock into SQL.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  bool|string  $value
+     * @return string
+     */
+    protected function compileLock($query, $value)
+    {
+        if (is_string($value)) return $value;
+
+        return $value ? 'for update' : 'lock in share mode';
+    }
+
+    /**
+     * Concatenate an array of segments, removing empties.
+     *
+     * @param  array   $segments
+     * @return string
+     */
+    protected function concatenate($segments)
+    {
+        return implode(' ', array_filter($segments, function($value)
+        {
+            return (string) $value !== '';
+        }));
+    }
+
+    /**
+     * Remove the leading boolean from a statement.
+     *
+     * @param  string  $value
+     * @return string
+     */
+    protected function removeLeadingBoolean($value)
+    {
+        return preg_replace('/and |or /', '', $value, 1);
+    }
+
+
 }

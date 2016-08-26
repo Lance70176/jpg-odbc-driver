@@ -4,6 +4,10 @@ namespace rexlu\Laravelodbc;
 use rexlu\Laravelodbc\ODBCSchemaGrammar as SchemaGrammar;
 use rexlu\Laravelodbc\ODBCQueryGrammar as QueryGrammar;
 use Illuminate\Database\Connection;
+use Illuminate\Database\Schema\MySqlBuilder;
+use Illuminate\Database\Query\Processors\MySqlProcessor;
+use Doctrine\DBAL\Driver\PDOMySql\Driver as DoctrineDriver;
+
 use PDO;
 
 class ODBCConnection extends Connection {
@@ -29,39 +33,35 @@ class ODBCConnection extends Connection {
     }
 
     /**
-     * @param string $format
-     * @return $this
+     * Get a schema builder instance for the connection.
+     *
+     * @return \Illuminate\Database\Schema\MySqlBuilder
      */
-    public function setDateFormat($format = 'YYYY-MM-DD HH24:MI:SS')
+    public function getSchemaBuilder()
     {
-        $this->statement("alter session set NLS_DATE_FORMAT = '$format'");
-        $this->statement("alter session set NLS_TIMESTAMP_FORMAT = '$format'");
-        return $this;
+        if (is_null($this->schemaGrammar)) { $this->useDefaultSchemaGrammar(); }
+
+        return new MySqlBuilder($this);
     }
 
-    public function beginTransaction()
+    /**
+     * Get the default post processor instance.
+     *
+     * @return \Illuminate\Database\Query\Processors\Processor
+     */
+    protected function getDefaultPostProcessor()
     {
-        parent::beginTransaction();
-
-        if ($this->transactions == 1)
-        {
-            $this->pdo->setAttribute(PDO::ATTR_AUTOCOMMIT, false);
-        }
+        return new MySqlProcessor;
     }
 
-    public function commit()
+    /**
+     * Get the Doctrine DBAL driver.
+     *
+     * @return \Doctrine\DBAL\Driver\PDOMySql\Driver
+     */
+    protected function getDoctrineDriver()
     {
-        if ($this->transactions == 1) {
-            $this->pdo->setAttribute(PDO::ATTR_AUTOCOMMIT, true);
-        }
-        parent::commit();
+        return new DoctrineDriver;
     }
 
-    public function rollBack()
-    {
-        if ($this->transactions == 1) {
-            $this->pdo->setAttribute(PDO::ATTR_AUTOCOMMIT, true);
-        }
-        parent::rollBack();
-    }
 }
